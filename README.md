@@ -9,7 +9,7 @@ A LLVM experimental code for pythonic FCI
 ## Usage
 - see test.py
 
-## Compilation
+## Installation
 Run the following command in the directory where `pyproject.toml` is located
 ```sh
 pip install -e .
