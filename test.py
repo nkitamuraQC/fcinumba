@@ -1,5 +1,4 @@
-from fci_plugin.fci_slow_numba import make_rdm1, make_rdm12, kernel
-from fci_plugin.selected_ci_slow_numba import kernel as selected_ci_kernel
+from fci_slow_numba import make_rdm1, make_rdm12, kernel
 from pyscf.fci import fci_slow, selected_ci_slow
 import numpy as np
 from pyscf import gto, scf, ao2mo
