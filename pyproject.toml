@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
     "pyscf>=2.13.0",
     "numba>=0.66.0",
+    "mpi4py"
 ]
 
 [tool.setuptools.packages.find]
