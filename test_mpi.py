@@ -1,4 +1,4 @@
-from fci_plugin.fci_slow_mpi import kernel as kernel_mpi
+from fci_slow_mpi import kernel as kernel_mpi
 from pyscf import gto, scf, ao2mo
 import numpy as np
 import time
