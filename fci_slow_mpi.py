@@ -46,46 +46,53 @@ def contract_2e(eri, fcivec, norb, nelec, link_index=None):
     ci0 = fcivec.reshape(na, nb)
 
     t1 = numpy.zeros((norb, norb, na, nb), dtype=fcivec.dtype)
-
-    # 各rankの担当分str0リストを作成
-    local_str0_a = numpy.array_split(numpy.arange(len(link_indexa)), size)[rank]
-    local_str0_b = numpy.array_split(numpy.arange(len(link_indexb)), size)[rank]
+    start_a = len(link_indexa) * rank // size
+    end_a = len(link_indexa) * (rank + 1) // size
+    start_b = len(link_indexb) * rank // size
+    end_b = len(link_indexb) * (rank + 1) // size
 
     # --- t1の構築(自分の担当分だけ) ---
-    for str0 in local_str0_a:
+    for str0 in range(start_a, end_a):
         tab = link_indexa[str0]
         for a, i, str1, sign in tab:
             t1[a, i, str1] += sign * ci0[str0]
 
-    for str0 in local_str0_b:
+    for str0 in range(start_b, end_b):
         tab = link_indexb[str0]          # ← link_indexa から link_indexb に修正
         for a, i, str1, sign in tab:
             t1[a, i, :, str1] += sign * ci0[:, str0]
 
-    # 各rankが部分的にしか埋めていないので合計して全rankに配布
-    t1_total = numpy.zeros_like(t1)
-    comm.Allreduce(t1, t1_total, op=MPI.SUM)
-    t1 = t1_total
+    # Sum the partial intermediates in place to avoid a second full-size array.
+    comm.Allreduce(MPI.IN_PLACE, t1, op=MPI.SUM)
 
-    t1 = lib.einsum('bjai,aiAB->bjAB', eri.reshape([norb] * 4), t1)
+    # Distribute the expensive ERI matrix multiplication by output orbital
+    # pair. Previously every rank performed the complete matrix product.
+    eri2 = eri.reshape(norb * norb, norb * norb)
+    t12 = t1.reshape(norb * norb, na * nb)
+    row_start = norb * norb * rank // size
+    row_end = norb * norb * (rank + 1) // size
+    local_t1 = (eri2[row_start:row_end] @ t12).reshape(
+        row_end - row_start, na, nb
+    )
+    del t1, t12
 
     fcinew = numpy.zeros_like(ci0, dtype=fcivec.dtype)
 
-    # --- fcinewの構築(自分の担当分だけ) ---
-    for str0 in local_str0_a:
-        tab = link_indexa[str0]
+    # Each rank contracts only the output orbital pairs from its matrix block.
+    for str0, tab in enumerate(link_indexa):
         for a, i, str1, sign in tab:
-            fcinew[str1] += sign * t1[a, i, str0]
+            row = a * norb + i
+            if row_start <= row < row_end:
+                fcinew[str1] += sign * local_t1[row - row_start, str0]
 
-    for str0 in local_str0_b:
-        tab = link_indexb[str0]          # ← こちらも修正
+    for str0, tab in enumerate(link_indexb):
         for a, i, str1, sign in tab:
-            fcinew[:, str1] += sign * t1[a, i, :, str0]
+            row = a * norb + i
+            if row_start <= row < row_end:
+                fcinew[:, str1] += sign * local_t1[row - row_start, :, str0]
 
-    # fcinewも各rankが部分的にしか埋めていないので合計
-    fcinew_total = numpy.zeros_like(fcinew)
-    comm.Allreduce(fcinew, fcinew_total, op=MPI.SUM)
-    fcinew = fcinew_total
+    # Combine each rank's partial CI vector in place.
+    comm.Allreduce(MPI.IN_PLACE, fcinew, op=MPI.SUM)
     return fcinew.reshape(fcivec.shape)
 
 
@@ -99,15 +106,28 @@ def contract_1e(f1e, fcivec, norb, nelec):
     link_indexb = cistring.gen_linkstr_index(range(norb), nelecb)
     na = cistring.num_strings(norb, neleca)
     nb = cistring.num_strings(norb, nelecb)
-    ci0 = fcivec.reshape(na,nb)
-    t1 = numpy.zeros((norb,norb,na,nb), dtype=fcivec.dtype)
-    for str0, tab in enumerate(link_indexa):
+    ci0 = fcivec.reshape(na, nb)
+    t1 = numpy.zeros((norb, norb, na, nb), dtype=fcivec.dtype)
+    start_a = len(link_indexa) * rank // size
+    end_a = len(link_indexa) * (rank + 1) // size
+    start_b = len(link_indexb) * rank // size
+    end_b = len(link_indexb) * (rank + 1) // size
+    for str0 in range(start_a, end_a):
+        tab = link_indexa[str0]
         for a, i, str1, sign in tab:
-            t1[a,i,str1] += sign * ci0[str0]
-    for str0, tab in enumerate(link_indexb):
+            t1[a, i, str1] += sign * ci0[str0]
+    for str0 in range(start_b, end_b):
+        tab = link_indexb[str0]
         for a, i, str1, sign in tab:
-            t1[a,i,:,str1] += sign * ci0[:,str0]
-    fcinew = numpy.dot(f1e.reshape(-1), t1.reshape(-1,na*nb))
+            t1[a, i, :, str1] += sign * ci0[:, str0]
+
+    comm.Allreduce(MPI.IN_PLACE, t1, op=MPI.SUM)
+    t12 = t1.reshape(norb * norb, na * nb)
+    f1e_flat = f1e.reshape(-1)
+    row_start = norb * norb * rank // size
+    row_end = norb * norb * (rank + 1) // size
+    fcinew = f1e_flat[row_start:row_end] @ t12[row_start:row_end]
+    comm.Allreduce(MPI.IN_PLACE, fcinew, op=MPI.SUM)
     return fcinew.reshape(fcivec.shape)
 
 
@@ -124,43 +144,30 @@ def contract_2e_hubbard(u, fcivec, norb, nelec, opt=None):
     strsb = cistring.gen_strings4orblist(range(norb), nelecb)
     na = cistring.num_strings(norb, neleca)
     nb = cistring.num_strings(norb, nelecb)
-    fcivec = fcivec.reshape(na,nb)
-    t1a = numpy.zeros((norb,na,nb))
-    t1b = numpy.zeros((norb,na,nb))
-    fcinew = numpy.zeros_like(fcivec)
+    ci0 = fcivec.reshape(na, nb)
+    occ_a = numpy.asarray(
+        [[(int(string) >> orbital) & 1 for orbital in range(norb)]
+         for string in strsa],
+        dtype=numpy.int8,
+    )
+    occ_b = numpy.asarray(
+        [[(int(string) >> orbital) & 1 for orbital in range(norb)]
+         for string in strsb],
+        dtype=numpy.int8,
+    )
+    nalpha = occ_a.sum(axis=1)
+    nbeta = occ_b.sum(axis=1)
+    fcinew = numpy.zeros_like(ci0)
 
-    for addr, s in enumerate(strsa):
-        for i in range(norb):
-            if s & (1 << i):
-                t1a[i,addr] += fcivec[addr]
-    for addr, s in enumerate(strsb):
-        for i in range(norb):
-            if s & (1 << i):
-                t1b[i,:,addr] += fcivec[:,addr]
+    # Each rank owns disjoint alpha-string rows of the output CI matrix.
+    start_a = na * rank // size
+    end_a = na * (rank + 1) // size
+    for addr_a in range(start_a, end_a):
+        overlap = occ_b @ occ_a[addr_a]
+        coeff = u_aa * nalpha[addr_a] + u_bb * nbeta + 2 * u_ab * overlap
+        fcinew[addr_a] = coeff * ci0[addr_a]
 
-    if u_aa != 0:
-        # u * n_alpha^+ n_alpha
-        for addr, s in enumerate(strsa):
-            for i in range(norb):
-                if s & (1 << i):
-                    fcinew[addr] += t1a[i,addr] * u_aa
-    if u_ab != 0:
-        # u * n_alpha^+ n_beta
-        for addr, s in enumerate(strsa):
-            for i in range(norb):
-                if s & (1 << i):
-                    fcinew[addr] += t1b[i,addr] * u_ab
-        # u * n_beta^+ n_alpha
-        for addr, s in enumerate(strsb):
-            for i in range(norb):
-                if s & (1 << i):
-                    fcinew[:,addr] += t1a[i,:,addr] * u_ab
-    if u_bb != 0:
-        # u * n_beta^+ n_beta
-        for addr, s in enumerate(strsb):
-            for i in range(norb):
-                if s & (1 << i):
-                    fcinew[:,addr] += t1b[i,:,addr] * u_bb
+    comm.Allreduce(MPI.IN_PLACE, fcinew, op=MPI.SUM)
     return fcinew
 
 
@@ -190,15 +197,22 @@ def make_hdiag(h1e, eri, norb, nelec, opt=None):
     eri = ao2mo.restore(1, eri, norb)
     diagj = numpy.einsum('iijj->ij', eri)
     diagk = numpy.einsum('ijji->ij', eri)
-    hdiag = []
-    for aocc in occslista:
-        for bocc in occslistb:
-            e1 = h1e[aocc,aocc].sum() + h1e[bocc,bocc].sum()
-            e2 = diagj[aocc][:,aocc].sum() + diagj[aocc][:,bocc].sum() \
-               + diagj[bocc][:,aocc].sum() + diagj[bocc][:,bocc].sum() \
-               - diagk[aocc][:,aocc].sum() - diagk[bocc][:,bocc].sum()
-            hdiag.append(e1 + e2*.5)
-    return numpy.array(hdiag)
+    na = len(occslista)
+    nb = len(occslistb)
+    hdiag = numpy.zeros(na * nb, dtype=h1e.dtype)
+    start = na * nb * rank // size
+    end = na * nb * (rank + 1) // size
+    for index in range(start, end):
+        ia, ib = divmod(index, nb)
+        aocc = occslista[ia]
+        bocc = occslistb[ib]
+        e1 = h1e[aocc, aocc].sum() + h1e[bocc, bocc].sum()
+        e2 = diagj[aocc][:, aocc].sum() + diagj[aocc][:, bocc].sum() \
+            + diagj[bocc][:, aocc].sum() + diagj[bocc][:, bocc].sum() \
+            - diagk[aocc][:, aocc].sum() - diagk[bocc][:, bocc].sum()
+        hdiag[index] = e1 + e2 * .5
+    comm.Allreduce(MPI.IN_PLACE, hdiag, op=MPI.SUM)
+    return hdiag
 
 def kernel(h1e, eri, norb, nelec, ecore=0):
     h2e = absorb_h1e(h1e, eri, norb, nelec, .5)
@@ -222,12 +236,16 @@ def make_rdm1(fcivec, norb, nelec, opt=None):
     na = cistring.num_strings(norb, nelec//2)
     fcivec = fcivec.reshape(na,na)
     rdm1 = numpy.zeros((norb,norb))
-    for str0, tab in enumerate(link_index):
+    start = len(link_index) * rank // size
+    end = len(link_index) * (rank + 1) // size
+    for str0 in range(start, end):
+        tab = link_index[str0]
+        for a, i, str1, sign in tab:
+            rdm1[a, i] += sign * numpy.dot(fcivec[str1], fcivec[str0])
+    for str0 in range(start, end):
         for a, i, str1, sign in link_index[str0]:
-            rdm1[a,i] += sign * numpy.dot(fcivec[str1],fcivec[str0])
-    for str0, tab in enumerate(link_index):
-        for a, i, str1, sign in link_index[str0]:
-            rdm1[a,i] += sign * numpy.dot(fcivec[:,str1],fcivec[:,str0])
+            rdm1[a, i] += sign * numpy.dot(fcivec[:, str1], fcivec[:, str0])
+    comm.Allreduce(MPI.IN_PLACE, rdm1, op=MPI.SUM)
     return rdm1
 
 # dm_pq,rs = <|p^+ q r^+ s|>
@@ -238,7 +256,10 @@ def make_rdm12(fcivec, norb, nelec, opt=None):
 
     rdm1 = numpy.zeros((norb,norb))
     rdm2 = numpy.zeros((norb,norb,norb,norb))
-    for str0, tab in enumerate(link_index):
+    start = len(link_index) * rank // size
+    end = len(link_index) * (rank + 1) // size
+    for str0 in range(start, end):
+        tab = link_index[str0]
         t1 = numpy.zeros((na,norb,norb))
         for a, i, str1, sign in link_index[str0]:
             t1[:,i,a] += sign * fcivec[str1,:]
@@ -250,6 +271,8 @@ def make_rdm12(fcivec, norb, nelec, opt=None):
         rdm1 += numpy.einsum('m,mij->ij', fcivec[str0], t1)
         # i^+ j|0> => <0|j^+ i, so swap i and j
         rdm2 += numpy.einsum('mij,mkl->jikl', t1, t1)
+    comm.Allreduce(MPI.IN_PLACE, rdm1, op=MPI.SUM)
+    comm.Allreduce(MPI.IN_PLACE, rdm2, op=MPI.SUM)
     return reorder_rdm(rdm1, rdm2)
 
 

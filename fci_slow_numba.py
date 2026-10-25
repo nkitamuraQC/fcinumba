@@ -20,12 +20,32 @@ import numpy
 from pyscf import lib
 from pyscf import ao2mo
 from pyscf.fci import cistring
-# from numba import njit
-from numba import njit, float64, int64, int32, prange
+from numba import njit
+
+
+@njit(cache=True)
+def _contract_1e_numba(f1e, fcivec, link_indexa, link_indexb, norb, na, nb):
+    ci0 = fcivec.reshape(na, nb)
+    t1 = numpy.zeros((norb, norb, na, nb), dtype=fcivec.dtype)
+    for str0 in range(link_indexa.shape[0]):
+        tab = link_indexa[str0]
+        for k in range(tab.shape[0]):
+            a, i, str1, sign = tab[k]
+            for ib in range(nb):
+                t1[a, i, str1, ib] += sign * ci0[str0, ib]
+    for str0 in range(link_indexb.shape[0]):
+        tab = link_indexb[str0]
+        for k in range(tab.shape[0]):
+            a, i, str1, sign = tab[k]
+            for ia in range(na):
+                t1[a, i, ia, str1] += sign * ci0[ia, str0]
+    result = f1e.reshape(norb * norb) @ t1.reshape(norb * norb, na * nb)
+    return result.reshape(na, nb)
+
 
 def contract_1e(f1e, fcivec, norb, nelec):
     if isinstance(nelec, (int, numpy.integer)):
-        nelecb = nelec//2
+        nelecb = nelec // 2
         neleca = nelec - nelecb
     else:
         neleca, nelecb = nelec
@@ -33,140 +53,129 @@ def contract_1e(f1e, fcivec, norb, nelec):
     link_indexb = cistring.gen_linkstr_index(range(norb), nelecb)
     na = cistring.num_strings(norb, neleca)
     nb = cistring.num_strings(norb, nelecb)
-    ci0 = fcivec.reshape(na,nb)
-    t1 = numpy.zeros((norb,norb,na,nb), dtype=fcivec.dtype)
-    for str0, tab in enumerate(link_indexa):
-        for a, i, str1, sign in tab:
-            t1[a,i,str1] += sign * ci0[str0]
-    for str0, tab in enumerate(link_indexb):
-        for a, i, str1, sign in tab:
-            t1[a,i,:,str1] += sign * ci0[:,str0]
-    fcinew = numpy.dot(f1e.reshape(-1), t1.reshape(-1,na*nb))
-    return fcinew.reshape(fcivec.shape)
+    return _contract_1e_numba(
+        f1e, fcivec, link_indexa, link_indexb, norb, na, nb
+    ).reshape(fcivec.shape)
 
 
-# @njit(
-#     float64[:](
-#         float64[:, :, :, :],        # eri
-#         float64[:, :],     # fcivec
-#         int64,             # norb
-#         int64,             # nelec
-#         int32[:, :, :],    # link_index
-#         int32[:, :, :],    # link_index
-#         int64,             # na
-#         int64              # nb
-#     )
-# )
-@njit(parallel=True)
-def contract_2e(eri, fcivec, norb, nelec, link_indexa, link_indexb, na, nb):
-    '''Compute E_{pq}E_{rs}|CI>'''
-    ci0 = fcivec.reshape(na,nb)
-    # ci0 = fcivec
-    t1 = numpy.zeros((norb,norb,na,nb), dtype=fcivec.dtype)
-    for str0, tab in enumerate(link_indexa):
-        for k in prange(tab.shape[0]):
-            a = tab[k, 0]
-            i = tab[k, 1]
-            str1 = tab[k, 2]
-            sign = tab[k, 3]
-            t1[a,i,str1] += sign * ci0[str0]
-    for str0, tab in enumerate(link_indexb):
-        for k in prange(tab.shape[0]):
-            a = tab[k, 0]
-            i = tab[k, 1]
-            str1 = tab[k, 2]
-            sign = tab[k, 3]
-            t1[a,i,:,str1] += sign * ci0[:,str0]
+@njit(cache=True)
+def _contract_2e_hubbard_numba(u_aa, u_ab, u_bb, fcivec, strsa, strsb,
+                               norb, na, nb):
+    t1a = numpy.zeros((norb, na, nb))
+    t1b = numpy.zeros((norb, na, nb))
+    fcinew = numpy.zeros_like(fcivec)
+    for addr in range(strsa.shape[0]):
+        s = strsa[addr]
+        for i in range(norb):
+            if s & (1 << i):
+                for ib in range(nb):
+                    t1a[i, addr, ib] += fcivec[addr, ib]
+    for addr in range(strsb.shape[0]):
+        s = strsb[addr]
+        for i in range(norb):
+            if s & (1 << i):
+                for ia in range(na):
+                    t1b[i, ia, addr] += fcivec[ia, addr]
+    if u_aa != 0:
+        for addr in range(strsa.shape[0]):
+            s = strsa[addr]
+            for i in range(norb):
+                if s & (1 << i):
+                    for ib in range(nb):
+                        fcinew[addr, ib] += t1a[i, addr, ib] * u_aa
+    if u_ab != 0:
+        for addr in range(strsa.shape[0]):
+            s = strsa[addr]
+            for i in range(norb):
+                if s & (1 << i):
+                    for ib in range(nb):
+                        fcinew[addr, ib] += t1b[i, addr, ib] * u_ab
+        for addr in range(strsb.shape[0]):
+            s = strsb[addr]
+            for i in range(norb):
+                if s & (1 << i):
+                    for ia in range(na):
+                        fcinew[ia, addr] += t1a[i, ia, addr] * u_ab
+    if u_bb != 0:
+        for addr in range(strsb.shape[0]):
+            s = strsb[addr]
+            for i in range(norb):
+                if s & (1 << i):
+                    for ia in range(na):
+                        fcinew[ia, addr] += t1b[i, ia, addr] * u_bb
+    return fcinew
 
-    # t1 = numpy.einsum('bjai,aiAB->bjAB', eri.reshape([norb]*4), t1)
-    out = numpy.zeros((norb, norb, na, nb), dtype=t1.dtype)
-    eri2 = eri.reshape(norb*norb, norb*norb)
-    t12 = t1.reshape(norb*norb, na*nb)
-    out = eri2 @ t12
-    t1 = out.reshape(norb, norb, na, nb)
-    # eri4 = eri.reshape((norb, norb, norb, norb))
-    # t1 = numpy.einsum('bjai,aiAB->bjAB', eri.reshape([norb]*4), t1)
-    # for b in range(norb): 
-    #     for j in range(norb): 
-    #         for A in range(na):
-    #             for B in prange(nb):
-    #                 s = 0.0
-    #                 for a in range(norb):
-    #                     for i in range(norb):
-    #                         s += eri[b, j, a, i] * t1[a, i, A, B]
-    #                 out[b, j, A, B] = s
-    # t1 = out
-
-    # ref = numpy.einsum("bjai,aiAB->bjAB", eri, t1)
-    # print(numpy.max(numpy.abs(out - ref)))
-
-    fcinew = numpy.zeros_like(ci0, dtype=fcivec.dtype)
-    for str0, tab in enumerate(link_indexa):
-        for k in prange(tab.shape[0]):
-            a    = tab[k, 0]
-            i    = tab[k, 1]
-            str1 = tab[k, 2]
-            sign = tab[k, 3]
-            fcinew[str1] += sign * t1[a,i,str0]
-    for str0, tab in enumerate(link_indexb):
-        for k in prange(tab.shape[0]):
-            a    = tab[k, 0]
-            i    = tab[k, 1]
-            str1 = tab[k, 2]
-            sign = tab[k, 3]
-            fcinew[:,str1] += sign * t1[a,i,:,str0]
-    return fcinew.reshape(-1)
 
 def contract_2e_hubbard(u, fcivec, norb, nelec, opt=None):
     if isinstance(nelec, (int, numpy.number)):
-        nelecb = nelec//2
+        nelecb = nelec // 2
         neleca = nelec - nelecb
     else:
         neleca, nelecb = nelec
-    u_aa, u_ab, u_bb = u
-
     strsa = cistring.gen_strings4orblist(range(norb), neleca)
     strsb = cistring.gen_strings4orblist(range(norb), nelecb)
     na = cistring.num_strings(norb, neleca)
     nb = cistring.num_strings(norb, nelecb)
-    fcivec = fcivec.reshape(na,nb)
-    t1a = numpy.zeros((norb,na,nb))
-    t1b = numpy.zeros((norb,na,nb))
-    fcinew = numpy.zeros_like(fcivec)
+    return _contract_2e_hubbard_numba(
+        u[0], u[1], u[2], fcivec.reshape(na, nb), strsa, strsb,
+        norb, na, nb
+    )
 
-    for addr, s in enumerate(strsa):
-        for i in range(norb):
-            if s & (1 << i):
-                t1a[i,addr] += fcivec[addr]
-    for addr, s in enumerate(strsb):
-        for i in range(norb):
-            if s & (1 << i):
-                t1b[i,:,addr] += fcivec[:,addr]
 
-    if u_aa != 0:
-        # u * n_alpha^+ n_alpha
-        for addr, s in enumerate(strsa):
-            for i in range(norb):
-                if s & (1 << i):
-                    fcinew[addr] += t1a[i,addr] * u_aa
-    if u_ab != 0:
-        # u * n_alpha^+ n_beta
-        for addr, s in enumerate(strsa):
-            for i in range(norb):
-                if s & (1 << i):
-                    fcinew[addr] += t1b[i,addr] * u_ab
-        # u * n_beta^+ n_alpha
-        for addr, s in enumerate(strsb):
-            for i in range(norb):
-                if s & (1 << i):
-                    fcinew[:,addr] += t1a[i,:,addr] * u_ab
-    if u_bb != 0:
-        # u * n_beta^+ n_beta
-        for addr, s in enumerate(strsb):
-            for i in range(norb):
-                if s & (1 << i):
-                    fcinew[:,addr] += t1b[i,:,addr] * u_bb
-    return fcinew
+@njit(cache=True)
+def contract_2e(eri, fcivec, norb, nelec, link_indexa, link_indexb, na, nb):
+    '''Compute E_{pq}E_{rs}|CI>'''
+    ci0 = fcivec.reshape(na,nb)
+    t1 = numpy.zeros((norb,norb,na,nb), dtype=fcivec.dtype)
+
+    # Build the alpha and beta excitation intermediates. These updates can
+    # target the same element, so keep them serial rather than using prange.
+    for str0 in range(link_indexa.shape[0]):
+        tab = link_indexa[str0]
+        for k in range(tab.shape[0]):
+            a = tab[k, 0]
+            i = tab[k, 1]
+            str1 = tab[k, 2]
+            sign = tab[k, 3]
+            for ib in range(nb):
+                t1[a,i,str1,ib] += sign * ci0[str0,ib]
+
+    for str0 in range(link_indexb.shape[0]):
+        tab = link_indexb[str0]
+        for k in range(tab.shape[0]):
+            a = tab[k, 0]
+            i = tab[k, 1]
+            str1 = tab[k, 2]
+            sign = tab[k, 3]
+            for ia in range(na):
+                t1[a,i,ia,str1] += sign * ci0[ia,str0]
+
+    # Let NumPy's optimized matrix multiplication handle the dense ERI step.
+    eri2 = eri.reshape(norb*norb, norb*norb)
+    t12 = t1.reshape(norb*norb, na*nb)
+    t1 = (eri2 @ t12).reshape(norb, norb, na, nb)
+
+    fcinew = numpy.zeros_like(ci0, dtype=fcivec.dtype)
+    for str0 in range(link_indexa.shape[0]):
+        tab = link_indexa[str0]
+        for k in range(tab.shape[0]):
+            a = tab[k, 0]
+            i = tab[k, 1]
+            str1 = tab[k, 2]
+            sign = tab[k, 3]
+            for ib in range(nb):
+                fcinew[str1,ib] += sign * t1[a,i,str0,ib]
+
+    for str0 in range(link_indexb.shape[0]):
+        tab = link_indexb[str0]
+        for k in range(tab.shape[0]):
+            a = tab[k, 0]
+            i = tab[k, 1]
+            str1 = tab[k, 2]
+            sign = tab[k, 3]
+            for ia in range(na):
+                fcinew[ia,str1] += sign * t1[a,i,ia,str0]
+    return fcinew.reshape(-1)
 
 
 def absorb_h1e(h1e, eri, norb, nelec, fac=1):
@@ -183,6 +192,37 @@ def absorb_h1e(h1e, eri, norb, nelec, fac=1):
     return h2e * fac
 
 
+@njit(cache=True)
+def _make_hdiag_numba(h1e, diagj, diagk, occslista, occslistb):
+    na = occslista.shape[0]
+    nb = occslistb.shape[0]
+    hdiag = numpy.empty(na * nb, dtype=h1e.dtype)
+    for ia in range(na):
+        for ib in range(nb):
+            e1 = 0.0
+            e2 = 0.0
+            for p in range(occslista.shape[1]):
+                pa = occslista[ia, p]
+                for q in range(occslista.shape[1]):
+                    qa = occslista[ia, q]
+                    e2 += diagj[pa, qa] - diagk[pa, qa]
+                for q in range(occslistb.shape[1]):
+                    qb = occslistb[ib, q]
+                    e2 += diagj[pa, qb]
+                e1 += h1e[pa, pa]
+            for p in range(occslistb.shape[1]):
+                pb = occslistb[ib, p]
+                for q in range(occslista.shape[1]):
+                    qa = occslista[ia, q]
+                    e2 += diagj[pb, qa]
+                for q in range(occslistb.shape[1]):
+                    qb = occslistb[ib, q]
+                    e2 += diagj[pb, qb] - diagk[pb, qb]
+                e1 += h1e[pb, pb]
+            hdiag[ia * nb + ib] = e1 + e2 * 0.5
+    return hdiag
+
+
 def make_hdiag(h1e, eri, norb, nelec, opt=None):
     if isinstance(nelec, (int, numpy.integer)):
         nelecb = nelec//2
@@ -195,15 +235,7 @@ def make_hdiag(h1e, eri, norb, nelec, opt=None):
     eri = ao2mo.restore(1, eri, norb)
     diagj = numpy.einsum('iijj->ij', eri)
     diagk = numpy.einsum('ijji->ij', eri)
-    hdiag = []
-    for aocc in occslista:
-        for bocc in occslistb:
-            e1 = h1e[aocc,aocc].sum() + h1e[bocc,bocc].sum()
-            e2 = diagj[aocc][:,aocc].sum() + diagj[aocc][:,bocc].sum() \
-               + diagj[bocc][:,aocc].sum() + diagj[bocc][:,bocc].sum() \
-               - diagk[aocc][:,aocc].sum() - diagk[bocc][:,bocc].sum()
-            hdiag.append(e1 + e2*.5)
-    return numpy.array(hdiag)
+    return _make_hdiag_numba(h1e, diagj, diagk, occslista, occslistb)
 
 def kernel(h1e, eri, norb, nelec, ecore=0):
     h2e = absorb_h1e(h1e, eri, norb, nelec, .5)
@@ -225,27 +257,33 @@ def kernel(h1e, eri, norb, nelec, ecore=0):
     return e+ecore
 
 
+@njit(cache=True)
+def _make_rdm1_numba(fcivec, link_index, norb, na):
+    rdm1 = numpy.zeros((norb, norb))
+    for str0 in range(link_index.shape[0]):
+        tab = link_index[str0]
+        for k in range(tab.shape[0]):
+            a, i, str1, sign = tab[k]
+            value = 0.0
+            for ib in range(na):
+                value += fcivec[str1, ib] * fcivec[str0, ib]
+            rdm1[a, i] += sign * value
+    for str0 in range(link_index.shape[0]):
+        tab = link_index[str0]
+        for k in range(tab.shape[0]):
+            a, i, str1, sign = tab[k]
+            value = 0.0
+            for ia in range(na):
+                value += fcivec[ia, str1] * fcivec[ia, str0]
+            rdm1[a, i] += sign * value
+    return rdm1
+
+
 # dm_pq = <|p^+ q|>
 def make_rdm1(fcivec, norb, nelec, opt=None):
-    link_index = cistring.gen_linkstr_index(range(norb), nelec//2)
-    na = cistring.num_strings(norb, nelec//2)
-    fcivec = fcivec.reshape(na,na)
-    rdm1 = numpy.zeros((norb,norb))
-    for str0, tab in enumerate(link_index):
-        for k in range(tab.shape[0]):
-            a = tab[k, 0]
-            i = tab[k, 1]
-            str1 = tab[k, 2]
-            sign = tab[k, 3]
-            rdm1[a,i] += sign * numpy.dot(fcivec[str1],fcivec[str0])
-    for str0, tab in enumerate(link_index):
-        for k in range(tab.shape[0]):
-            a = tab[k, 0]
-            i = tab[k, 1]
-            str1 = tab[k, 2]
-            sign = tab[k, 3]
-            rdm1[a,i] += sign * numpy.dot(fcivec[:,str1],fcivec[:,str0])
-    return rdm1
+    link_index = cistring.gen_linkstr_index(range(norb), nelec // 2)
+    na = cistring.num_strings(norb, nelec // 2)
+    return _make_rdm1_numba(fcivec.reshape(na, na), link_index, norb, na)
 
 # dm_pq,rs = <|p^+ q r^+ s|>
 def make_rdm12(fcivec, norb, nelec, opt=None):
