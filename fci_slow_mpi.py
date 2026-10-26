@@ -16,6 +16,10 @@
 # Author: Qiming Sun <osirpt.sun@gmail.com>
 #
 
+# Modifications Copyright 2026 Naoki Kitamura.
+# Modified from the original PySCF implementation for Numba
+# optimization and MPI parallelization.
+
 import numpy
 from pyscf import lib
 from pyscf import ao2mo
